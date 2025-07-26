@@ -1,20 +1,22 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import ccxt
 import requests
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import numpy as np
 import time
+from flask_cors import CORS
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # CoinGecko API base URL
 COINGECKO_API = "https://api.coingecko.com/api/v3"
@@ -22,21 +24,17 @@ COINGECKO_API = "https://api.coingecko.com/api/v3"
 # Ticker to CoinGecko ID mapping
 COINGECKO_IDS = {
     'BTC': 'bitcoin',
-    'XBT': 'xbt',
+    'XBT': 'bitcoin',
     'ETH': 'ethereum',
     'ADA': 'cardano',
     'SOL': 'solana',
-    'DOGE': 'dogecoin',
-    'PENGU': 'pudgy-penguins',
-    'DOT': 'Polkadot',
-    'XRP': 'XRP',
-    'MANYU' 'manyu'
+    'DOGE': 'dogecoin'
 }
 
-# Add root route for browser testing
+# Serve Mooney_GUI.html at root
 @app.route('/')
 def home():
-    return 'Crypto Analysis API is running! Use POST /analyze with {"ticker": "BTC"}'
+    return send_file('Mooney_GUI.html')
 
 def calculate_score(rsi, price_change, volatility, macd_diff, bb_position, vol_to_mcap, market_cap, circ_supply_percent):
     score = 0
@@ -63,7 +61,7 @@ def calculate_score(rsi, price_change, volatility, macd_diff, bb_position, vol_t
     score += vol_score
     
     # MACD (15%)
-    if macd_diff > 0:
+    if macd_diff is not None and macd_diff > 0:
         score += 15
     
     # Bollinger Bands (10%)
@@ -104,6 +102,81 @@ def get_recommendation(score):
     else:
         return "hold"
 
+def calculate_price_target(latest_price, sma_30, bb_upper, bb_lower, rsi, macd_diff, volatility):
+    """Calculate a 7-day price target based on technical indicators, adjusted for volatility."""
+    # Base target on latest price for responsiveness
+    target = latest_price
+    
+    # Adjust based on SMA trend
+    if latest_price > sma_30:
+        trend_factor = (latest_price - sma_30) / sma_30 * 0.3  # Up to 30% adjustment
+        target *= (1 + trend_factor)
+    else:
+        trend_factor = (sma_30 - latest_price) / sma_30 * 0.3
+        target *= (1 - trend_factor)
+    
+    # Adjust based on Bollinger Bands
+    if latest_price > sma_30:
+        bb_weight = min((latest_price - sma_30) / (bb_upper - sma_30), 1) if bb_upper > sma_30 else 0
+        target += bb_weight * (bb_upper - latest_price) * 0.4
+    else:
+        bb_weight = min((sma_30 - latest_price) / (sma_30 - bb_lower), 1) if sma_30 > bb_lower else 0
+        target -= bb_weight * (latest_price - bb_lower) * 0.4
+    
+    # Adjust based on RSI
+    if rsi < 30:
+        target *= 1.1  # Oversold: Stronger rebound
+    elif rsi > 70:
+        target *= 0.9  # Overbought: Stronger pullback
+    
+    # Adjust based on MACD
+    if macd_diff is not None:
+        if macd_diff > 0:
+            target *= 1.05  # Bullish momentum
+        elif macd_diff < 0:
+            target *= 0.95  # Bearish momentum
+    
+    # Volatility adjustment: Higher volatility increases target range
+    vol_factor = min(volatility / 100, 0.5)  # Cap at 50% adjustment
+    if target > latest_price:
+        target *= (1 + vol_factor * 0.2)
+    else:
+        target *= (1 - vol_factor * 0.2)
+    
+    return round(target, 4)  # Higher precision for low-priced assets like DOGE
+
+def get_trend_prediction(rsi, macd_diff, bb_position, latest_price, sma_30):
+    """Predict trend direction (up or down) based on indicators."""
+    score = 0
+    
+    # RSI: Oversold = bullish, overbought = bearish
+    if rsi < 30:
+        score += 2
+    elif rsi > 70:
+        score -= 2
+    
+    # MACD: Positive = bullish, negative = bearish
+    if macd_diff is not None:
+        if macd_diff > 0:
+            score += 2
+        elif macd_diff < 0:
+            score -= 2
+        # Neutral MACD (near 0) contributes no score
+    
+    # Bollinger Position: Below lower = bullish, above upper = bearish
+    if bb_position < 0:
+        score += 1
+    elif bb_position > 1:
+        score -= 1
+    
+    # Price vs SMA: Above = bullish, below = bearish
+    if latest_price > sma_30:
+        score += 1
+    elif latest_price < sma_30:
+        score -= 1
+    
+    return "up" if score > 0 else "down"
+
 @app.route('/analyze', methods=['POST'])
 def analyze_crypto():
     try:
@@ -123,11 +196,11 @@ def analyze_crypto():
         exchange = ccxt.kraken()
         symbol = f"{ticker}/USD"  # Kraken uses USD
         
-        # Fetch 30 days of daily OHLCV data with retries
+        # Fetch 60 days of daily OHLCV data to ensure enough data for MACD
         retries = 3
         for attempt in range(retries):
             try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=30)
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=60)
                 break
             except ccxt.NetworkError as e:
                 if attempt < retries - 1:
@@ -143,17 +216,17 @@ def analyze_crypto():
         closing_prices = [candle[4] for candle in ohlcv]
         prices_df = pd.DataFrame(closing_prices, columns=['close'])
 
-        # Price-based metrics
+        # Price-based metrics (use last 30 days for consistency)
         latest_price = closing_prices[-1]
-        avg_price = sum(closing_prices) / len(closing_prices)
-        price_change = ((latest_price - closing_prices[0]) / closing_prices[0]) * 100
+        avg_price = sum(closing_prices[-30:]) / len(closing_prices[-30:])
+        price_change = ((latest_price - closing_prices[-30]) / closing_prices[-30]) * 100
         returns = prices_df['close'].pct_change().dropna()
         volatility = returns.std() * np.sqrt(365) * 100  # Annualized volatility
 
         # Technical indicators
         rsi = RSIIndicator(prices_df['close'], window=14).rsi().iloc[-1]
         sma_30 = prices_df['close'].rolling(window=30).mean().iloc[-1]
-        macd = MACD(prices_df['close']).macd_diff().iloc[-1]
+        macd = MACD(prices_df['close'], window_slow=20, window_fast=10, window_sign=6).macd_diff().iloc[-1]
         bb = BollingerBands(prices_df['close'], window=20)
         bb_upper = bb.bollinger_hband().iloc[-1]
         bb_lower = bb.bollinger_lband().iloc[-1]
@@ -192,6 +265,10 @@ def analyze_crypto():
         score = calculate_score(rsi, price_change, volatility, macd, bb_position, vol_to_mcap, market_cap, circ_supply_percent)
         recommendation = get_recommendation(score)
 
+        # Calculate price target and trend prediction
+        price_target_7d = calculate_price_target(latest_price, sma_30, bb_upper, bb_lower, rsi, macd, volatility)
+        trend_prediction = get_trend_prediction(rsi, macd, bb_position, latest_price, sma_30)
+
         # Prepare response
         result = {
             'ticker': ticker,
@@ -201,7 +278,7 @@ def analyze_crypto():
             'volatility_percent': round(volatility, 2),
             'rsi': round(rsi, 2),
             'sma_30': round(sma_30, 2),
-            'macd_diff': round(macd, 2),
+            'macd_diff': round(macd, 2) if not pd.isna(macd) else None,
             'bollinger_position': round(bb_position, 2),
             'market_cap_usd': market_cap,
             'volume_24h_usd': volume_24h,
@@ -209,7 +286,9 @@ def analyze_crypto():
             'circulating_supply_percent': round(circ_supply_percent, 2),
             'score': score,
             'recommendation': recommendation,
-            'timestamp': datetime.utcnow().isoformat()
+            'price_target_7d': price_target_7d,
+            'trend_prediction': trend_prediction,
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
         logger.info(f"Analysis completed for {ticker}: {result}")
