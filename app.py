@@ -22,7 +22,7 @@ COINGECKO_API = "https://api.coingecko.com/api/v3"
 # Ticker to CoinGecko ID mapping
 COINGECKO_IDS = {
     'BTC': 'bitcoin',
-    'XBT': 'bitcoin',
+    'XBT': 'xbt',
     'ETH': 'ethereum',
     'ADA': 'cardano',
     'SOL': 'solana',
