@@ -27,7 +27,10 @@ COINGECKO_IDS = {
     'ADA': 'cardano',
     'SOL': 'solana',
     'DOGE': 'dogecoin',
-    'PENGU': 'pudgypenguins'
+    'PENGU': 'pudgy-penguins',
+    'DOT': 'Polkadot',
+    'XRP': 'XRP',
+    'MANYU' 'manyu'
 }
 
 # Add root route for browser testing
