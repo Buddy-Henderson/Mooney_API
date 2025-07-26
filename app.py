@@ -21,15 +21,31 @@ CORS(app)  # Enable CORS for all routes
 # CoinGecko API base URL
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 
-# Ticker to CoinGecko ID mapping
-COINGECKO_IDS = {
-    'BTC': 'bitcoin',
-    'XBT': 'bitcoin',
-    'ETH': 'ethereum',
-    'ADA': 'cardano',
-    'SOL': 'solana',
-    'DOGE': 'dogecoin'
-}
+# Global cache for CoinGecko coin list
+COINGECKO_COIN_LIST = []
+
+def fetch_coingecko_coin_list():
+    """Fetch and cache CoinGecko's list of coins."""
+    global COINGECKO_COIN_LIST
+    try:
+        response = requests.get(f"{COINGECKO_API}/coins/list", timeout=10)
+        response.raise_for_status()
+        COINGECKO_COIN_LIST = response.json()  # List of {'id': 'bitcoin', 'symbol': 'btc', 'name': 'Bitcoin'}, ...
+        logger.info(f"Fetched {len(COINGECKO_COIN_LIST)} coins from CoinGecko")
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch CoinGecko coin list: {str(e)}")
+        COINGECKO_COIN_LIST = []
+
+# Fetch coin list at startup
+fetch_coingecko_coin_list()
+
+def get_coingecko_id(ticker):
+    """Map a ticker to its CoinGecko ID."""
+    ticker = ticker.lower()
+    for coin in COINGECKO_COIN_LIST:
+        if coin['symbol'].lower() == ticker or coin['id'].lower() == ticker:
+            return coin['id']
+    return None
 
 # Serve Mooney_GUI.html at root
 @app.route('/')
@@ -104,12 +120,11 @@ def get_recommendation(score):
 
 def calculate_price_target(latest_price, sma_30, bb_upper, bb_lower, rsi, macd_diff, volatility):
     """Calculate a 7-day price target based on technical indicators, adjusted for volatility."""
-    # Base target on latest price for responsiveness
     target = latest_price
     
     # Adjust based on SMA trend
     if latest_price > sma_30:
-        trend_factor = (latest_price - sma_30) / sma_30 * 0.3  # Up to 30% adjustment
+        trend_factor = (latest_price - sma_30) / sma_30 * 0.3
         target *= (1 + trend_factor)
     else:
         trend_factor = (sma_30 - latest_price) / sma_30 * 0.3
@@ -118,58 +133,52 @@ def calculate_price_target(latest_price, sma_30, bb_upper, bb_lower, rsi, macd_d
     # Adjust based on Bollinger Bands
     if latest_price > sma_30:
         bb_weight = min((latest_price - sma_30) / (bb_upper - sma_30), 1) if bb_upper > sma_30 else 0
-        target += bb_weight * (bb_upper - latest_price) * 0.4
+        target += bb_weight * (bb_upper - latest_price) * 0.6
     else:
         bb_weight = min((sma_30 - latest_price) / (sma_30 - bb_lower), 1) if sma_30 > bb_lower else 0
-        target -= bb_weight * (latest_price - bb_lower) * 0.4
+        target -= bb_weight * (latest_price - bb_lower) * 0.6
     
     # Adjust based on RSI
     if rsi < 30:
-        target *= 1.1  # Oversold: Stronger rebound
+        target *= 1.1
     elif rsi > 70:
-        target *= 0.9  # Overbought: Stronger pullback
+        target *= 0.9
     
     # Adjust based on MACD
     if macd_diff is not None:
         if macd_diff > 0:
-            target *= 1.05  # Bullish momentum
+            target *= 1.05
         elif macd_diff < 0:
-            target *= 0.95  # Bearish momentum
+            target *= 0.95
     
-    # Volatility adjustment: Higher volatility increases target range
-    vol_factor = min(volatility / 100, 0.5)  # Cap at 50% adjustment
+    # Volatility adjustment
+    vol_factor = min(volatility / 100, 0.5)
     if target > latest_price:
         target *= (1 + vol_factor * 0.2)
     else:
         target *= (1 - vol_factor * 0.2)
     
-    return round(target, 4)  # Higher precision for low-priced assets like DOGE
+    return round(target, 4)
 
 def get_trend_prediction(rsi, macd_diff, bb_position, latest_price, sma_30):
-    """Predict trend direction (up or down) based on indicators."""
     score = 0
     
-    # RSI: Oversold = bullish, overbought = bearish
     if rsi < 30:
         score += 2
     elif rsi > 70:
         score -= 2
     
-    # MACD: Positive = bullish, negative = bearish
     if macd_diff is not None:
         if macd_diff > 0:
             score += 2
         elif macd_diff < 0:
             score -= 2
-        # Neutral MACD (near 0) contributes no score
     
-    # Bollinger Position: Below lower = bullish, above upper = bearish
     if bb_position < 0:
         score += 1
     elif bb_position > 1:
         score -= 1
     
-    # Price vs SMA: Above = bullish, below = bearish
     if latest_price > sma_30:
         score += 1
     elif latest_price < sma_30:
@@ -190,13 +199,28 @@ def analyze_crypto():
         logger.info(f"Processing analysis for ticker: {ticker}")
 
         # Map ticker to CoinGecko ID
-        coingecko_id = COINGECKO_IDS.get(ticker.upper(), ticker.lower())
-        
+        coingecko_id = get_coingecko_id(ticker)
+        if not coingecko_id:
+            logger.error(f"No CoinGecko ID found for ticker: {ticker}")
+            return jsonify({'error': f"Ticker {ticker} not found on CoinGecko"}), 404
+
         # Initialize exchange (Kraken)
         exchange = ccxt.kraken()
-        symbol = f"{ticker}/USD"  # Kraken uses USD
+        symbol = f"{ticker}/USD"
         
-        # Fetch 60 days of daily OHLCV data to ensure enough data for MACD
+        # Validate symbol on Kraken
+        markets = exchange.load_markets()
+        if symbol not in markets:
+            # Try alternative symbols (e.g., XBT for BTC)
+            for market_symbol in markets:
+                if market_symbol.endswith('/USD') and market_symbol.startswith(ticker):
+                    symbol = market_symbol
+                    break
+            else:
+                logger.error(f"No USD trading pair found for {ticker} on Kraken")
+                return jsonify({'error': f"No USD trading pair for {ticker} on Kraken"}), 404
+        
+        # Fetch 60 days of daily OHLCV data
         retries = 3
         for attempt in range(retries):
             try:
@@ -216,12 +240,12 @@ def analyze_crypto():
         closing_prices = [candle[4] for candle in ohlcv]
         prices_df = pd.DataFrame(closing_prices, columns=['close'])
 
-        # Price-based metrics (use last 30 days for consistency)
+        # Price-based metrics (use last 30 days)
         latest_price = closing_prices[-1]
         avg_price = sum(closing_prices[-30:]) / len(closing_prices[-30:])
         price_change = ((latest_price - closing_prices[-30]) / closing_prices[-30]) * 100
         returns = prices_df['close'].pct_change().dropna()
-        volatility = returns.std() * np.sqrt(365) * 100  # Annualized volatility
+        volatility = returns.std() * np.sqrt(365) * 100
 
         # Technical indicators
         rsi = RSIIndicator(prices_df['close'], window=14).rsi().iloc[-1]
@@ -232,13 +256,13 @@ def analyze_crypto():
         bb_lower = bb.bollinger_lband().iloc[-1]
         bb_position = (latest_price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0
 
-        # Fetch CoinGecko data with retries
+        # Fetch CoinGecko data
         coingecko_data = None
         for attempt in range(retries):
             try:
                 coingecko_response = requests.get(f"{COINGECKO_API}/coins/markets", 
-                                               params={'vs_currency': 'usd', 'ids': coingecko_id})
-                coingecko_response.raise_for_status()  # Raise exception for HTTP errors
+                                                 params={'vs_currency': 'usd', 'ids': coingecko_id})
+                coingecko_response.raise_for_status()
                 coingecko_data = coingecko_response.json()
                 logger.info(f"CoinGecko response for {ticker}: {coingecko_data}")
                 break
